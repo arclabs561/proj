@@ -135,4 +135,18 @@ mod tests {
         assert!((vec[1] - 0.5).abs() < 1e-6);
         assert!((vec[2] - 0.0).abs() < 1e-6);
     }
+
+    #[test]
+    fn test_codebook_rejects_zero_dim() {
+        let err = Codebook::new(vec![1.0, 2.0, 3.0], 0).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Dimension cannot be zero"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_codebook_rejects_non_multiple() {
+        let err = Codebook::new(vec![1.0, 2.0, 3.0], 2).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Matrix size must be multiple of dimension"), "got: {msg}");
+    }
 }
