@@ -1,0 +1,22 @@
+[package]
+categories = ["science", "algorithms"]
+name = "proj"
+version = "0.1.0"
+edition = "2021"
+description = "Symbolic projection and embeddings for Tekne"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/arclabs561/proj"
+homepage = "https://github.com/arclabs561/proj"
+documentation = "https://docs.rs/proj"
+keywords = ["embeddings", "projection", "vector-search", "tekne"]
+authors = ["Arc <attobop@gmail.com>"]
+
+[dependencies]
+innr = { path = "../innr" }
+textprep = { path = "../textprep" }
+serde = { version = "1.0", features = ["derive"], optional = true }
+thiserror = "2.0"
+
+[features]
+default = []
+persistence = ["dep:serde"]
