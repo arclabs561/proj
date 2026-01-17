@@ -26,6 +26,7 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// A Codebook maps token IDs to dense vectors.
+#[derive(Debug, Clone)]
 pub struct Codebook {
     /// Flattened embedding matrix [vocab_size * dim]
     matrix: Vec<f32>,
