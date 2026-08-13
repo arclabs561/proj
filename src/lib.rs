@@ -29,6 +29,10 @@ pub enum Error {
     ZeroDimension,
     #[error("matrix length {len} is not a multiple of dimension {dim}")]
     InvalidMatrixShape { len: usize, dim: usize },
+    #[error("weight at index {index} must be finite")]
+    NonFiniteWeight { index: usize },
+    #[error("component direction must have finite unit norm")]
+    InvalidUnitDirection,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -233,6 +237,12 @@ impl Codebook {
     /// SIF sentence embedding from Arora et al. (2017) divides by sentence
     /// length before first-principal-component removal; callers that need that
     /// exact convention should scale weights before calling this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::WeightLenMismatch`] when the lengths differ,
+    /// [`Error::TokenNotFound`] when an ID is absent, or
+    /// [`Error::NonFiniteWeight`] when a weight is NaN or infinite.
     pub fn encode_ids_weighted_strict(&self, ids: &[u32], weights: &[f32]) -> Result<Vec<f32>> {
         if ids.len() != weights.len() {
             return Err(Error::WeightLenMismatch {
@@ -242,6 +252,9 @@ impl Codebook {
         }
         if ids.is_empty() {
             return Ok(vec![0.0; self.dim]);
+        }
+        if let Some(index) = weights.iter().position(|weight| !weight.is_finite()) {
+            return Err(Error::NonFiniteWeight { index });
         }
 
         let dim = self.dim;
@@ -363,17 +376,12 @@ impl Index<u32> for Codebook {
 /// \]
 /// where \(p\) is token probability and \(a\) is a small smoothing constant (often \(10^{-3}\)).
 ///
-/// Returns `0.0` when `a <= 0` or `p < 0`. Negative probabilities are not meaningful;
-/// this function treats them as a no-op rather than panicking, but a `debug_assert`
-/// fires in debug builds to help catch upstream bugs.
+/// Returns `0.0` when either input is non-finite, `a <= 0`, or `p < 0`.
+/// Negative probabilities are not meaningful, so this function treats them as a no-op.
 #[inline]
 #[must_use]
 pub fn sif_weight(p: f32, a: f32) -> f32 {
-    debug_assert!(p >= 0.0, "sif_weight: p must be non-negative, got {p}");
-    if a <= 0.0 {
-        return 0.0;
-    }
-    if p < 0.0 {
+    if !p.is_finite() || !a.is_finite() || a <= 0.0 || p < 0.0 {
         return 0.0;
     }
     a / (a + p)
@@ -390,14 +398,16 @@ pub fn l2_normalize_in_place(v: &mut [f32]) {
 
     #[cfg(not(feature = "simd"))]
     {
+        const NORM_EPSILON: f32 = 1e-9;
         let mut ss = 0.0f32;
         for &x in v.iter() {
             ss += x * x;
         }
-        if ss <= 0.0 {
+        let norm = ss.sqrt();
+        if norm <= NORM_EPSILON {
             return;
         }
-        let inv = 1.0f32 / ss.sqrt();
+        let inv = 1.0f32 / norm;
         for x in v.iter_mut() {
             *x *= inv;
         }
@@ -447,7 +457,8 @@ pub fn remove_component_in_place(v: &mut [f32], u: &[f32]) -> Result<()> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::DimensionMismatch`] when `v` and `u_unit` have different lengths.
+/// Returns [`Error::DimensionMismatch`] when `v` and `u_unit` have different lengths,
+/// or [`Error::InvalidUnitDirection`] when `u_unit` is non-finite or does not have unit norm.
 pub fn remove_component_unit_in_place(v: &mut [f32], u_unit: &[f32]) -> Result<()> {
     if v.len() != u_unit.len() {
         return Err(Error::DimensionMismatch {
@@ -455,10 +466,10 @@ pub fn remove_component_unit_in_place(v: &mut [f32], u_unit: &[f32]) -> Result<(
             got: u_unit.len(),
         });
     }
-    debug_assert!(
-        (u_unit.iter().map(|x| x * x).sum::<f32>().sqrt() - 1.0).abs() < 0.01,
-        "u_unit should be approximately unit norm"
-    );
+    let norm = u_unit.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if !norm.is_finite() || (norm - 1.0).abs() >= 0.01 {
+        return Err(Error::InvalidUnitDirection);
+    }
     let mut dot = 0.0f32;
     for (&ui, &vi) in u_unit.iter().zip(v.iter()) {
         dot = ui.mul_add(vi, dot);
@@ -715,10 +726,52 @@ mod tests {
     }
 
     #[test]
+    fn weighted_mean_rejects_nonfinite_weights() {
+        let codebook = Codebook::new(vec![1.0, 0.0, 0.0, 1.0], 2).unwrap();
+        for weight in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = codebook
+                .encode_ids_weighted_strict(&[0, 1], &[weight, 1.0])
+                .unwrap_err();
+            assert!(matches!(err, Error::NonFiniteWeight { index: 0 }));
+        }
+    }
+
+    #[test]
+    fn weighted_mean_preserves_finite_signed_weight_behavior() {
+        let codebook = Codebook::new(vec![1.0, 0.0, 0.0, 1.0], 2).unwrap();
+        let encoded = codebook
+            .encode_ids_weighted_strict(&[0, 1], &[-1.0, 2.0])
+            .unwrap();
+
+        assert_eq!(encoded, vec![-1.0, 2.0]);
+    }
+
+    #[test]
     fn l2_normalize_noop_on_zero_vector() {
         let mut v = vec![0.0f32, 0.0, 0.0];
         l2_normalize_in_place(&mut v);
         assert_eq!(&v[..], &[0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn l2_normalize_noop_below_shared_norm_threshold() {
+        let mut v = vec![1e-10f32, 0.0];
+        l2_normalize_in_place(&mut v);
+        assert_eq!(v, vec![1e-10, 0.0]);
+    }
+
+    #[test]
+    fn sif_weight_invalid_inputs_return_zero() {
+        for (p, a) in [
+            (-0.1, 1e-3),
+            (f32::NAN, 1e-3),
+            (f32::INFINITY, 1e-3),
+            (0.1, f32::NAN),
+            (0.1, f32::INFINITY),
+            (0.1, f32::NEG_INFINITY),
+        ] {
+            assert_eq!(sif_weight(p, a), 0.0);
+        }
     }
 
     #[test]
@@ -750,6 +803,40 @@ mod tests {
         remove_component_unit_in_place(&mut via_unit, &u).unwrap();
 
         assert_eq!(via_unit, via_general);
+    }
+
+    #[test]
+    fn remove_component_unit_rejects_invalid_direction_without_mutating() {
+        for u in [vec![2.0f32, 0.0], vec![0.0, 0.0], vec![f32::NAN, 0.0]] {
+            let mut v = vec![3.0f32, 4.0];
+            let before = v.clone();
+
+            let err = remove_component_unit_in_place(&mut v, &u).unwrap_err();
+
+            assert!(matches!(err, Error::InvalidUnitDirection));
+            assert_eq!(v, before);
+        }
+    }
+
+    #[test]
+    fn remove_component_is_idempotent_and_direction_scale_invariant() {
+        let original = vec![3.0f32, 4.0, 5.0];
+        let direction = vec![1.0f32, -2.0, 0.5];
+        let scaled_direction: Vec<f32> = direction.iter().map(|x| x * -3.0).collect();
+        let mut projected = original.clone();
+        let mut projected_scaled = original;
+
+        remove_component_in_place(&mut projected, &direction).unwrap();
+        remove_component_in_place(&mut projected_scaled, &scaled_direction).unwrap();
+        for (&a, &b) in projected.iter().zip(&projected_scaled) {
+            assert!((a - b).abs() < 1e-5, "scale invariance: {a} != {b}");
+        }
+
+        let once = projected.clone();
+        remove_component_in_place(&mut projected, &direction).unwrap();
+        for (&a, &b) in projected.iter().zip(&once) {
+            assert!((a - b).abs() < 1e-5, "idempotence: {a} != {b}");
+        }
     }
 
     #[test]
